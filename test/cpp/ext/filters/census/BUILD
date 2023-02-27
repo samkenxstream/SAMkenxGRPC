@@ -56,7 +56,10 @@ grpc_cc_test(
     flaky = True,
     language = "C++",
     linkstatic = True,
-    tags = ["no_windows"],  # TODO(jtattermusch): fix test on windows
+    tags = [
+        "census_test",
+        "no_windows",
+    ],  # TODO(jtattermusch): fix test on windows
     deps = [
         "library",
         "//:grpc++",
@@ -82,7 +85,39 @@ grpc_cc_test(
     flaky = True,
     language = "C++",
     linkstatic = True,
-    tags = ["no_windows"],  # TODO(jtattermusch): fix test on windows
+    tags = [
+        "census_test",
+        "no_windows",
+    ],  # TODO(jtattermusch): fix test on windows
+    deps = [
+        "library",
+        "//:grpc++",
+        "//:grpc_opencensus_plugin",
+        "//src/proto/grpc/testing:echo_proto",
+        "//test/core/util:grpc_test_util",
+        "//test/cpp/util:test_config",
+        "//test/cpp/util:test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "constant_labels_wait_test",
+    srcs = [
+        "constant_labels_wait_test.cc",
+    ],
+    external_deps = [
+        "gtest",
+        "opencensus-stats-test",
+        "opencensus-tags",
+        "opencensus-with-tag-map",
+    ],
+    flaky = True,
+    language = "C++",
+    linkstatic = True,
+    tags = [
+        "census_test",
+        "no_windows",
+    ],  # TODO(jtattermusch): fix test on windows
     deps = [
         "library",
         "//:grpc++",

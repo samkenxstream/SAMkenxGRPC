@@ -55,7 +55,7 @@ Aggregation MillisDistributionAggregation() {
 
 void SetConstantLabels(ViewDescriptor* descriptor) {
   for (const auto& label :
-       grpc::internal::OpenCensusRegistry::Get().constant_labels()) {
+       grpc::internal::OpenCensusRegistry::Get().ConstantLabels()) {
     descriptor->add_column(label.tag_key);
   }
 }
@@ -130,6 +130,16 @@ const ViewDescriptor& ClientRoundtripLatency() {
       DefaultViewDescriptor()
           .set_name("grpc.io/client/roundtrip_latency")
           .set_measure(kRpcClientRoundtripLatencyMeasureName)
+          .set_aggregation(MillisDistributionAggregation())
+          .add_column(ClientMethodTagKey());
+  return descriptor;
+}
+
+const ViewDescriptor& ClientTransportLatency() {
+  const static ViewDescriptor descriptor =
+      DefaultViewDescriptor()
+          .set_name("grpc.io/client/transport_latency")
+          .set_measure(kRpcClientTransportLatencyMeasureName)
           .set_aggregation(MillisDistributionAggregation())
           .add_column(ClientMethodTagKey());
   return descriptor;
