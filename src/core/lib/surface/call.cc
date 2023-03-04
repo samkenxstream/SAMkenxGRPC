@@ -60,6 +60,7 @@
 #include <grpc/support/time.h>
 
 #include "src/core/lib/channel/call_finalization.h"
+#include "src/core/lib/channel/call_tracer.h"
 #include "src/core/lib/channel/channel_stack.h"
 #include "src/core/lib/channel/channelz.h"
 #include "src/core/lib/channel/context.h"
@@ -499,6 +500,7 @@ class FilterStackCall final : public Call {
   }
   struct BatchControl {
     FilterStackCall* call_ = nullptr;
+    CallTracer* call_tracer_ = nullptr;
     grpc_transport_stream_op_batch op_;
     // Share memory for cq_completion and notify_tag as they are never needed
     // simultaneously. Each byte used in this data structure count as six bytes
@@ -528,12 +530,31 @@ class FilterStackCall final : public Call {
     }
     bool completed_batch_step(PendingOp op) {
       auto mask = PendingOpMask(op);
+      // Acquire call tracer before ops_pending_.fetch_sub to avoid races with
+      // call_ being set to nullptr in PostCompletion method. Store the
+      // call_tracer_ and call_ variables locally as well because they could be
+      // modified by another thread after the fetch_sub operation.
+      CallTracer* call_tracer = call_tracer_;
+      FilterStackCall* call = call_;
+      bool is_call_trace_enabled = grpc_call_trace.enabled();
+      bool is_call_ops_annotate_enabled =
+          (IsTraceRecordCallopsEnabled() && call_tracer != nullptr);
+      if (is_call_ops_annotate_enabled) {
+        call->InternalRef("Call ops annotate");
+      }
       auto r = ops_pending_.fetch_sub(mask, std::memory_order_acq_rel);
-      if (grpc_call_trace.enabled()) {
-        gpr_log(GPR_DEBUG, "BATCH:%p COMPLETE:%s REMAINING:%s (tag:%p)", this,
-                PendingOpString(mask).c_str(),
-                PendingOpString(r & ~mask).c_str(),
-                completion_data_.notify_tag.tag);
+      if (is_call_trace_enabled || is_call_ops_annotate_enabled) {
+        std::string trace_string = absl::StrFormat(
+            "BATCH:%p COMPLETE:%s REMAINING:%s (tag:%p)", this,
+            PendingOpString(mask).c_str(), PendingOpString(r & ~mask).c_str(),
+            completion_data_.notify_tag.tag);
+        if (is_call_trace_enabled) {
+          gpr_log(GPR_DEBUG, "%s", trace_string.c_str());
+        }
+        if (is_call_ops_annotate_enabled) {
+          call_tracer->RecordAnnotation(trace_string);
+          call->InternalUnref("Call ops annotate");
+        }
       }
       GPR_ASSERT((r & mask) != 0);
       return r == mask;
@@ -1152,6 +1173,8 @@ FilterStackCall::BatchControl* FilterStackCall::ReuseOrAllocateBatchControl(
     *pslot = bctl;
   }
   bctl->call_ = this;
+  bctl->call_tracer_ =
+      static_cast<CallTracer*>(ContextGet(GRPC_CONTEXT_CALL_TRACER));
   bctl->op_.payload = &stream_op_payload_;
   return bctl;
 }
@@ -1422,6 +1445,7 @@ grpc_call_error FilterStackCall::StartBatch(const grpc_op* ops, size_t nops,
   grpc_transport_stream_op_batch_payload* stream_op_payload;
   uint32_t seen_ops = 0;
   intptr_t pending_ops = 0;
+  CallTracer* call_tracer = nullptr;
 
   for (i = 0; i < nops; i++) {
     if (seen_ops & (1u << ops[i].op)) {
@@ -1813,13 +1837,20 @@ grpc_call_error FilterStackCall::StartBatch(const grpc_op* ops, size_t nops,
     stream_op->on_complete = &bctl->finish_batch_;
   }
 
+  call_tracer = static_cast<CallTracer*>(ContextGet(GRPC_CONTEXT_CALL_TRACER));
+  if ((IsTraceRecordCallopsEnabled() && call_tracer != nullptr)) {
+    call_tracer->RecordAnnotation(absl::StrFormat(
+        "BATCH:%p START:%s BATCH:%s (tag:%p)", bctl,
+        PendingOpString(pending_ops).c_str(),
+        grpc_transport_stream_op_batch_string(stream_op, true).c_str(),
+        bctl->completion_data_.notify_tag.tag));
+  }
   if (grpc_call_trace.enabled()) {
     gpr_log(GPR_DEBUG, "BATCH:%p START:%s BATCH:%s (tag:%p)", bctl,
             PendingOpString(pending_ops).c_str(),
-            grpc_transport_stream_op_batch_string(stream_op).c_str(),
+            grpc_transport_stream_op_batch_string(stream_op, false).c_str(),
             bctl->completion_data_.notify_tag.tag);
   }
-
   ExecuteBatch(stream_op, &bctl->start_batch_);
 
 done:
@@ -2598,7 +2629,7 @@ void PromiseBasedCall::StartSendMessage(const grpc_op& op,
 bool PromiseBasedCall::PollSendMessage() {
   if (!outstanding_send_.has_value()) return true;
   Poll<bool> r = (*outstanding_send_)();
-  if (const bool* result = absl::get_if<bool>(&r)) {
+  if (const bool* result = r.value_if_ready()) {
     if (grpc_call_trace.enabled()) {
       gpr_log(GPR_DEBUG, "%sPollSendMessage completes %s", DebugTag().c_str(),
               *result ? "successfully" : "with failure");
@@ -2633,7 +2664,7 @@ void PromiseBasedCall::PollRecvMessage(
     grpc_compression_algorithm incoming_compression_algorithm) {
   if (!outstanding_recv_.has_value()) return;
   Poll<NextResult<MessageHandle>> r = (*outstanding_recv_)();
-  if (auto* result = absl::get_if<NextResult<MessageHandle>>(&r)) {
+  if (auto* result = r.value_if_ready()) {
     outstanding_recv_.reset();
     if (result->has_value()) {
       MessageHandle& message = **result;
@@ -2984,8 +3015,7 @@ void ClientPromiseBasedCall::UpdateOnce() {
   if (server_initial_metadata_ready_.has_value()) {
     Poll<NextResult<ServerMetadataHandle>> r =
         (*server_initial_metadata_ready_)();
-    if (auto* server_initial_metadata =
-            absl::get_if<NextResult<ServerMetadataHandle>>(&r)) {
+    if (auto* server_initial_metadata = r.value_if_ready()) {
       PublishInitialMetadata(server_initial_metadata->value().get());
     } else if (completed()) {
       ServerMetadata no_metadata{GetContext<Arena>()};
@@ -3010,7 +3040,7 @@ void ClientPromiseBasedCall::UpdateOnce() {
                 return h->DebugString();
               }).c_str());
     }
-    if (auto* result = absl::get_if<ServerMetadataHandle>(&r)) {
+    if (auto* result = r.value_if_ready()) {
       AcceptTransportStatsFromContext();
       Finish(std::move(*result));
     }
@@ -3040,7 +3070,7 @@ void ClientPromiseBasedCall::Finish(ServerMetadataHandle trailing_metadata) {
   Poll<NextResult<ServerMetadataHandle>> r =
       (*server_initial_metadata_ready_)();
   server_initial_metadata_ready_.reset();
-  if (auto* result = absl::get_if<NextResult<ServerMetadataHandle>>(&r)) {
+  if (auto* result = r.value_if_ready()) {
     if (pending_initial_metadata) PublishInitialMetadata(result->value().get());
     is_trailers_only_ = false;
   } else {
@@ -3325,7 +3355,7 @@ void ServerPromiseBasedCall::UpdateOnce() {
   if (auto* p =
           absl::get_if<typename PipeSender<ServerMetadataHandle>::PushType>(
               &send_initial_metadata_state_)) {
-    if (!absl::holds_alternative<Pending>((*p)())) {
+    if ((*p)().ready()) {
       send_initial_metadata_state_ = absl::monostate{};
     }
   }
@@ -3338,7 +3368,7 @@ void ServerPromiseBasedCall::UpdateOnce() {
                 return h->DebugString();
               }).c_str());
     }
-    if (auto* result = absl::get_if<ServerMetadataHandle>(&r)) {
+    if (auto* result = r.value_if_ready()) {
       if (grpc_call_trace.enabled()) {
         gpr_log(GPR_INFO, "%s[call] UpdateOnce: GotResult %s result:%s",
                 DebugTag().c_str(),
