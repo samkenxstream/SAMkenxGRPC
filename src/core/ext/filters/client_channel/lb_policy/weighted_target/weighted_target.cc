@@ -649,8 +649,8 @@ void WeightedTargetLb::WeightedChild::OnConnectivityStateUpdateLocked(
       state == GRPC_CHANNEL_READY) {
     connectivity_state_ = state;
   }
-  // Notify the LB policy.
-  weighted_target_policy_->UpdateStateLocked();
+  // Update the LB policy's state if this child is not deactivated.
+  if (weight_ != 0) weighted_target_policy_->UpdateStateLocked();
 }
 
 void WeightedTargetLb::WeightedChild::DeactivateLocked() {
@@ -730,8 +730,8 @@ const JsonLoaderInterface* WeightedTargetLbConfig::ChildConfig::JsonLoader(
 void WeightedTargetLbConfig::ChildConfig::JsonPostLoad(
     const Json& json, const JsonArgs&, ValidationErrors* errors) {
   ValidationErrors::ScopedField field(errors, ".childPolicy");
-  auto it = json.object_value().find("childPolicy");
-  if (it == json.object_value().end()) {
+  auto it = json.object().find("childPolicy");
+  if (it == json.object().end()) {
     errors->AddError("field not present");
     return;
   }
@@ -764,7 +764,7 @@ class WeightedTargetLbFactory : public LoadBalancingPolicyFactory {
 
   absl::StatusOr<RefCountedPtr<LoadBalancingPolicy::Config>>
   ParseLoadBalancingConfig(const Json& json) const override {
-    if (json.type() == Json::Type::JSON_NULL) {
+    if (json.type() == Json::Type::kNull) {
       // weighted_target was mentioned as a policy in the deprecated
       // loadBalancingPolicy field or in the client API.
       return absl::InvalidArgumentError(
