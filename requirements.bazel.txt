@@ -11,7 +11,7 @@ certifi==2017.4.17
 idna==2.7
 gevent==22.08.0
 zope.event==4.5.0
-setuptools==44.1.1
+setuptools==70.0.0
 xds-protos==0.0.11
 opencensus==0.10.0
 opencensus-ext-stackdriver==0.8.0
